@@ -32,8 +32,7 @@ export class ProviderClient {
 
   public async start() {
     await this.connectToHost();
-    await this.buildAndSubmitMerkleRoot(); // Build + submit Merkle root immediately
-    // Then repeat every 10 min
+    await this.buildAndSubmitMerkleRoot(); // initial Merkle root
     this.merkleIntervalId = setInterval(() => {
       this.buildAndSubmitMerkleRoot();
     }, this.merkleIntervalMs);
@@ -64,9 +63,15 @@ export class ProviderClient {
             case 'STORE_CHUNK':
               await this.handleStoreChunk(parsed);
               break;
+
             case 'REQUEST_CHUNK_PROOF':
               await this.handleRequestChunkProof(parsed);
               break;
+
+            case 'REQUEST_CHUNK_DATA':
+              await this.handleRequestChunkData(parsed);
+              break;
+
             default:
               logger.warn(`Unknown message from host: ${parsed.type}`);
           }
@@ -111,12 +116,15 @@ export class ProviderClient {
     }
   }
 
+  /**
+   * Handle chunk storage from the host
+   */
   private async handleStoreChunk(parsed: any) {
     const { chunkHash, data } = parsed;
     const rawBuf = Buffer.from(data, 'hex');
 
-    // Verify chunk hash
-    const computed = generateHash(rawBuf);
+    // verify chunk hash
+    const computed = generateHash(rawBuf);  // Use the deterministic version
     if (computed !== chunkHash) {
       logger.error(`Hash mismatch => expected=${chunkHash}, got=${computed}`);
       return;
@@ -124,10 +132,14 @@ export class ProviderClient {
 
     await this.dataStore.storeData(chunkHash, rawBuf);
     logger.info(`Provider => stored chunk ${chunkHash}`);
-    // Optionally do a Merkle rebuild or wait for the interval
+
+    // optionally rebuild Merkle
     // await this.buildAndSubmitMerkleRoot();
   }
 
+  /**
+   * The host is asking for a chunk proof
+   */
   private async handleRequestChunkProof(parsed: any) {
     const { chunkHash } = parsed;
     const chunkBuf = await this.dataStore.retrieveData(chunkHash);
@@ -148,11 +160,35 @@ export class ProviderClient {
         chunkHash,
         proof,
         merkleRoot: this.merkleRoot,
-        // We'll still call it "encryptedHex" for consistency, but it's just raw hex data
+        // We'll still call it "encryptedHex", but it's just raw data
         encryptedHex: chunkBuf.toString('hex'),
       })
     );
 
     logger.info(`Provider => CHUNK_PROOF for ${chunkHash}`);
+  }
+
+  /**
+   * The host wants the chunk data for reassembly
+   */
+  private async handleRequestChunkData(parsed: any) {
+    const { fileHash, chunkHash } = parsed;
+    const chunkBuf = await this.dataStore.retrieveData(chunkHash);
+    if (!chunkBuf) {
+      logger.warn(`Provider => missing chunk ${chunkHash}, cannot return data`);
+      return;
+    }
+
+    // Send chunk data back
+    this.ws?.send(
+      JSON.stringify({
+        type: 'CHUNK_DATA',
+        fileHash,
+        chunkHash,
+        dataHex: chunkBuf.toString('hex'),
+      })
+    );
+
+    logger.info(`Provider => CHUNK_DATA for ${chunkHash}, file=${fileHash}`);
   }
 }

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image Upload</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    .upload-form {
+      margin-bottom: 20px;
+    }
+    .result {
+      margin-top: 20px;
+    }
+    .file-preview {
+      margin-top: 10px;
+      max-width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Upload Image</h1>
+    <form id="uploadForm" class="upload-form">
+      <label for="fileInput">Choose an image to upload:</label>
+      <input type="file" id="fileInput" name="file" accept="image/*" required />
+      <button type="submit">Upload</button>
+    </form>
+    <div id="result" class="result"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById('uploadForm');
+    const fileInput = document.getElementById('fileInput');
+    const resultDiv = document.getElementById('result');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault(); // Prevent the form from refreshing the page
+
+      const file = fileInput.files[0];
+      if (!file) {
+        alert('Please select a file to upload.');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const response = await fetch('http://localhost:5001/upload', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          throw new Error(`Error: ${response.statusText}`);
+        }
+
+        const result = await response.json();
+        resultDiv.innerHTML = `
+          <h3>Upload Successful</h3>
+          <p>File Hash: ${result.uploaded[0].fileHash}</p>
+          <p>Merkle Root: ${result.uploaded[0].merkleRoot}</p>
+          <p>File Name: ${result.uploaded[0].fileName}</p>
+          <img class="file-preview" src="${URL.createObjectURL(file)}" alt="Uploaded Image Preview" />
+        `;
+      } catch (error) {
+        resultDiv.innerHTML = `<h3>Error</h3><p>${error.message}</p>`;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,19 +1,37 @@
 import crypto from 'crypto';
 
 /**
- * Prefix with 'nlg' after SHA256 hashing.
+ * Generate a purely random 256-bit hash (used e.g. for fileHash).
+ * We prefix with `nlg` to maintain your naming style.
  */
-
-
 export function generateRandomHash(): string {
-  // Create 32 bytes of randomness => 256 bits
-  const randomHex = crypto.randomBytes(32).toString('hex');
-  return `nlg${randomHex}`.slice(0, 43);
+  const randomHex = crypto.randomBytes(32).toString('hex'); // 64 hex chars
+  return `nlg${randomHex}`;
 }
+
+/**
+ * Generate a deterministic hash for chunk data.
+ * Removed the random suffix to ensure same data produces same hash.
+ * This ensures consistency between host and provider verification.
+ */
 export function generateHash(data: string | Buffer): string {
-    const hash = crypto.createHash('sha256').update(data).digest('hex');
-   return `nlg${hash}`.slice(0, 20);
-  }
+  const shaPart = crypto.createHash('sha256').update(data).digest('hex');
+  return `nlg${shaPart}`;
+}
+
+/**
+ * Generate a unique hash for chunk data by combining the data hash with a timestamp.
+ * Use this when you need unique hashes even for identical chunks.
+ */
+export function generateUniqueHash(data: string | Buffer): string {
+  const timestamp = Date.now().toString();
+  const combinedData = Buffer.concat([
+    Buffer.isBuffer(data) ? data : Buffer.from(data),
+    Buffer.from(timestamp)
+  ]);
+  const shaPart = crypto.createHash('sha256').update(combinedData).digest('hex');
+  return `nlg${shaPart}`;
+}
 
 /**
  * Split a Buffer into fixed-size chunks.

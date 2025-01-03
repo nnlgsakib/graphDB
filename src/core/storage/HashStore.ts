@@ -1,15 +1,14 @@
 import level from 'level';
-import logger  from '../utils/logger';
+import logger from '../utils/logger';
 
 export interface FileMeta {
   fileHash: string;
   merkleRoot: string;
   chunkHashes: string[];
   chunkProviders: Record<string, string[]>;
-   // Add these:
-   fileName?: string;
-   contentType?: string;
-   fileSize?: number;
+  fileName?: string;
+  contentType?: string;
+  fileSize?: number;
 }
 
 export class HashStore {
@@ -32,5 +31,25 @@ export class HashStore {
       if (err.notFound) return null;
       throw err;
     }
+  }
+
+  /**
+   * Retrieve an array of all file-hash keys in the database.
+   */
+  public async getAllFileMetaKeys(): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      const keys: string[] = [];
+      this.db
+        .createKeyStream()
+        .on('data', (key: string) => {
+          keys.push(key);
+        })
+        .on('error', (err: any) => {
+          reject(err);
+        })
+        .on('end', () => {
+          resolve(keys);
+        });
+    });
   }
 }
