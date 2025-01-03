@@ -1,0 +1,7 @@
+2025-01-03T10:29:56.016Z [INFO] 🔍 DataStore init: ./db-provider/data 
+2025-01-03T10:29:56.024Z [INFO] 🔍 HashStore init: ./db-provider/hashes 
+2025-01-03T10:29:56.024Z [INFO] 🔍 ProofStore init: ./db-provider/proofs 
+2025-01-03T10:29:56.037Z [INFO] 🔍 Provider => connected to Host 
+2025-01-03T10:29:56.046Z [INFO] 🔍 Provider => MERKLE_UPDATE => 3fe019803c130049 
+2025-01-03T10:29:56.047Z [INFO] 🔍 ProviderClient started => host=localhost, port=5000 
+2025-01-03T10:29:56.047Z [INFO] 🔍 Provider started (host=localhost, port=5000, dbDir=./db-provider) 
