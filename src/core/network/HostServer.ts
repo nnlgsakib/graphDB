@@ -4,43 +4,29 @@ import cors from 'cors';
 import WebSocket from 'ws';
 import multer from 'multer';
 import logger from '../utils/logger';
-import { HashStore, FileMeta } from '../storage/HashStore';
-import { ProofStore } from '../storage/ProofStore';
-import { chunkBuffer, generateHash, generateRandomHash } from '../utils/cryptoutils';
+import { generateHash, generateRandomHash, chunkBuffer } from '../utils/cryptoutils';
 import { buildMerkleTree } from '../utils/merkleutils';
 
 interface ProviderInfo {
   id: string;
   ws: WebSocket;
   isOnline: boolean;
-  latestMerkleRoot: string | null;
-  assignedChunks: Set<string>;
+  merkleRoot: string | null;
+  storedHashes: Set<string>;
+  metadata: Map<string, FileMeta>;
 }
 
-/**
- * MIME types that we render inline (browser typically supports).
- * Everything else => we force as "attachment".
- */
-const INLINE_MIME_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'text/html',
-  'text/plain',
-  'application/pdf',
-  // Add others if you want them to open in-browser
-]);
+interface FileMeta {
+  fileHash: string;
+  merkleRoot: string;
+  chunkHashes: string[];
+  fileName: string;
+  contentType: string;
+  fileSize: number;
+  timestamp: number;
+  providerIds: string[];
+}
 
-/**
- * Temporary structure for ongoing "read" requests
- * Key: fileHash
- * Value: An object with:
- *   - totalChunks: number
- *   - chunksReceived: number
- *   - chunkData: Record<chunkHash, Buffer>
- *   - resolve / reject for a Promise
- */
 interface ReadRequest {
   totalChunks: number;
   chunksReceived: number;
@@ -49,50 +35,85 @@ interface ReadRequest {
   reject: (err: Error) => void;
 }
 
+const INLINE_MIME_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'text/html', 'text/plain', 'application/pdf'
+]);
+
 export class HostServer {
   private bootPort: number;
   private apiPort: number;
-
-  // The Host no longer uses a DataStore for chunks
-  // but we keep hashStore, proofStore for tracking
-  private hashStore: HashStore;
-  private proofStore: ProofStore;
-
   private providers: Map<string, ProviderInfo> = new Map();
   private providerCounter = 0;
-  private challengeIntervalMs = 5 * 60 * 1000;
-  private challengeInterval: NodeJS.Timeout | null = null;
-
-  // Track read requests in progress
   private readRequests: Map<string, ReadRequest> = new Map();
+  private minProviderCount = 3;
+  private replicationFactor = 3;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private metadataCache: Map<string, FileMeta> = new Map();
 
-  constructor(bootPort: number, apiPort: number, dbDir: string) {
+  constructor(bootPort: number, apiPort: number) {
     this.bootPort = bootPort;
     this.apiPort = apiPort;
-
-    // No DataStore for the Host
-    this.hashStore = new HashStore(`${dbDir}/hashes`);
-    this.proofStore = new ProofStore(`${dbDir}/proofs`);
   }
 
   public async start() {
     await this.startWebSocketServer();
     await this.startApiServer();
-
-    // Automatic chunk challenges every 5 minutes
-    this.challengeInterval = setInterval(() => {
-      this.issueRandomChunkChallenge();
-    }, this.challengeIntervalMs);
-
+    this.startHealthCheck();
     logger.info(`HostServer up => bootPort=${this.bootPort}, apiPort=${this.apiPort}`);
   }
 
-  /**
-   * Spin up WebSocket server for Provider connections
-   */
+  private startHealthCheck() {
+    this.healthCheckInterval = setInterval(() => {
+      this.providers.forEach((provider, id) => {
+        if (provider.isOnline) {
+          provider.ws.ping();
+          const timeout = setTimeout(() => {
+            provider.isOnline = false;
+            this.redistributeProviderData(id);
+          }, 5000);
+
+          provider.ws.once('pong', () => {
+            clearTimeout(timeout);
+          });
+        }
+      });
+    }, 30000);
+  }
+
+  private async redistributeProviderData(failedProviderId: string) {
+    const failedProvider = this.providers.get(failedProviderId);
+    if (!failedProvider) return;
+
+    const onlineProviders = Array.from(this.providers.values())
+      .filter(p => p.isOnline && p.id !== failedProviderId);
+    
+    if (onlineProviders.length < this.minProviderCount) {
+      logger.error('Not enough providers for redistribution');
+      return;
+    }
+
+    failedProvider.metadata.forEach((meta, fileHash) => {
+      const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
+      targetProviders.forEach(provider => {
+        provider.metadata.set(fileHash, meta);
+        provider.ws.send(JSON.stringify({
+          type: 'SYNC_METADATA',
+          fileHash,
+          metadata: meta
+        }));
+      });
+    });
+  }
+
+  private selectProviders(providers: ProviderInfo[], count: number): ProviderInfo[] {
+    return providers
+      .sort(() => Math.random() - 0.5)
+      .slice(0, Math.min(count, providers.length));
+  }
+
   private async startWebSocketServer() {
     const server = http.createServer();
-
     const wss = new WebSocket.Server({ server });
 
     wss.on('connection', (ws) => {
@@ -101,401 +122,326 @@ export class HostServer {
         id: providerId,
         ws,
         isOnline: true,
-        latestMerkleRoot: null,
-        assignedChunks: new Set<string>(),
+        merkleRoot: null,
+        storedHashes: new Set(),
+        metadata: new Map()
       };
+      
       this.providers.set(providerId, provider);
-
       logger.info(`Provider connected => ${providerId}`);
 
-      // Listen for messages from Provider
+      this.syncProviderState(provider);
+
       ws.on('message', async (message) => {
-        const data = message.toString();
         try {
-          const parsed = JSON.parse(data);
-          switch (parsed.type) {
-            case 'REGISTER_PROVIDER':
-              logger.info(`Registered provider => ${providerId}`);
-              break;
-
-            case 'MERKLE_UPDATE':
-              provider.latestMerkleRoot = parsed.root || null;
-              logger.info(`Provider ${providerId} => MERKLE_UPDATE root=${parsed.root}`);
-              break;
-
-            case 'CHUNK_PROOF':
-              await this.handleChunkProof(providerId, parsed);
-              break;
-
-            case 'CHUNK_DATA':
-              // Provider is sending us chunk data in response to a read request
-              await this.handleChunkData(providerId, parsed);
-              break;
-
-            default:
-              logger.warn(`Unknown message type from ${providerId}: ${parsed.type}`);
-          }
-        } catch (e) {
-          logger.warn(`Failed to parse message from ${providerId}: ${data}`, e);
+          const data = JSON.parse(message.toString());
+          await this.handleProviderMessage(providerId, data);
+        } catch (error) {
+          logger.error('Error handling provider message:', error);
         }
       });
 
       ws.on('close', () => {
         provider.isOnline = false;
-        logger.info(`Provider offline => ${providerId}`);
+        this.redistributeProviderData(providerId);
+      });
+
+      ws.on('error', (error) => {
+        logger.error(`WebSocket error for provider ${providerId}:`, error);
+        provider.isOnline = false;
       });
     });
 
     return new Promise<void>((resolve) => {
-      server.listen(this.bootPort, () => {
-        logger.info(`WebSocket server (and HTTP) listening on port ${this.bootPort}`);
-        resolve();
-      });
+      server.listen(this.bootPort, () => resolve());
     });
   }
 
-  /**
-   * Start the REST API server
-   */
   private async startApiServer() {
     const app = express();
     app.use(cors());
     app.use(express.json({ limit: '50mb' }));
-
-    // Multer => for any file input
+    
     const storage = multer.memoryStorage();
     const upload = multer({ storage });
 
-    /**
-     * POST /upload => handle file or text input
-     * No chunks are stored on the Host; we push them to Providers
-     */
     app.post('/upload', upload.any(), async (req, res) => {
       try {
-        if (req.files && Array.isArray(req.files) && req.files.length > 0) {
-          // Multiple file(s)
-          const results = [];
-          for (const file of req.files as Express.Multer.File[]) {
-            const fileBuffer = file.buffer;
-            const fileName = file.originalname || 'unknown';
-            const contentType = file.mimetype || 'application/octet-stream';
-            const fileSize = file.size || fileBuffer.length;
-
-            // 1) Generate random hash
-            const fileHash = generateRandomHash();
-
-            // 2) Split into 64KB chunks in-memory
-            const chunkSize = 64 * 1024;
-            const chunks = chunkBuffer(fileBuffer, chunkSize);
-
-            // 3) Hash each chunk, send to Providers
-            const chunkHashes: string[] = [];
-            for (const chunk of chunks) {
-              const cHash = generateHash(chunk);
-              chunkHashes.push(cHash);
-              // Instruct providers to store it now
-              this.instructProvidersToStoreChunk(cHash, chunk);
-            }
-
-            // 4) Build Merkle root
-            const { root: merkleRoot } = buildMerkleTree(chunkHashes);
-
-            // 5) Store metadata in Host
-            const fileMeta: FileMeta = {
-              fileHash,
-              merkleRoot,
-              chunkHashes,
-              chunkProviders: {}, // you can fill if you want
-              fileName,
-              contentType,
-              fileSize,
-            };
-            await this.hashStore.storeFileMeta(fileHash, fileMeta);
-            await this.proofStore.storeProof(fileHash, { merkleRoot });
-
-            results.push({ fileHash, merkleRoot, fileName, contentType, fileSize });
-          }
-
-          return res.json({ uploaded: results });
-        } else if (req.body && req.body.data) {
-          // Plain text
-          const textBuffer = Buffer.from(req.body.data);
-
-          const fileHash = generateRandomHash();
-          const chunkSize = 64 * 1024;
-          const chunks = chunkBuffer(textBuffer, chunkSize);
-
-          const chunkHashes: string[] = [];
-          for (const chunk of chunks) {
-            const cHash = generateHash(chunk);
-            chunkHashes.push(cHash);
-            this.instructProvidersToStoreChunk(cHash, chunk);
-          }
-
-          const { root: merkleRoot } = buildMerkleTree(chunkHashes);
-
-          const fileMeta: FileMeta = {
-            fileHash,
-            merkleRoot,
-            chunkHashes,
-            chunkProviders: {},
-            fileName: 'plaintext.txt',
-            contentType: 'text/plain',
-            fileSize: textBuffer.length,
-          };
-          await this.hashStore.storeFileMeta(fileHash, fileMeta);
-          await this.proofStore.storeProof(fileHash, { merkleRoot });
-
-          return res.json({
-            fileHash,
-            merkleRoot,
-            fileName: fileMeta.fileName,
-            contentType: fileMeta.contentType,
-            fileSize: fileMeta.fileSize,
-          });
-        } else {
-          return res.status(400).json({ error: 'No file or data provided.' });
+        if (!this.hasEnoughProviders()) {
+          return res.status(503).json({ error: 'Not enough providers available' });
         }
-      } catch (err: any) {
-        logger.error('Error in /upload:', err);
-        return res.status(500).json({ error: err.message });
+
+        const results = await this.handleUpload(req);
+        res.json({ uploaded: results });
+      } catch (error: any) {
+        logger.error('Upload error:', error);
+        res.status(500).json({ error: error.message });
       }
     });
 
-    /**
-     * GET /file/:fileHash => fetch chunk data from Providers, inline or download
-     */
     app.get('/file/:fileHash', async (req, res) => {
       try {
         const { fileHash } = req.params;
-        const meta = await this.hashStore.retrieveFileMeta(fileHash);
-        if (!meta) {
-          return res.status(404).send('File not found in metadata.');
+        const file = await this.getFile(fileHash);
+        
+        if (!file) {
+          return res.status(404).json({ error: 'File not found' });
         }
 
-        // We'll retrieve chunk data from the Providers by sending a message
-        // Then wait until all chunk data is returned
-        const chunkHashes = meta.chunkHashes;
-        if (!chunkHashes || chunkHashes.length === 0) {
-          return res.status(500).send('No chunks associated with this file.');
-        }
-
-        // Create an in-memory promise that waits for chunk data
-        const fileBuf = await this.requestAllChunks(fileHash, chunkHashes);
-
-        // Decide whether inline or download
-        const contentType = (meta as any).contentType || 'application/octet-stream';
-        const fileName = (meta as any).fileName || fileHash;
-
-        if (INLINE_MIME_TYPES.has(contentType)) {
-          res.setHeader('Content-Type', contentType);
-          res.send(fileBuf);
+        const { buffer, metadata } = file;
+        
+        if (INLINE_MIME_TYPES.has(metadata.contentType)) {
+          res.setHeader('Content-Type', metadata.contentType);
+          res.send(buffer);
         } else {
           res.setHeader('Content-Type', 'application/octet-stream');
-          res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-          res.send(fileBuf);
+          res.setHeader('Content-Disposition', `attachment; filename="${metadata.fileName}"`);
+          res.send(buffer);
         }
-      } catch (err: any) {
-        logger.error('Error in /file:', err);
-        return res.status(500).send(err.message);
+      } catch (error: any) {
+        logger.error('File retrieval error:', error);
+        res.status(500).json({ error: error.message });
       }
     });
 
-    /**
-     * Example: manual challenge
-     */
-    app.get('/challenge/:providerId/:chunkHash', (req, res) => {
-      const { providerId, chunkHash } = req.params;
-      const provider = this.providers.get(providerId);
-      if (!provider || !provider.isOnline) {
-        return res.status(404).json({ error: 'Provider not found or offline.' });
+    app.get('/files', async (req, res) => {
+      try {
+        const files = Array.from(this.metadataCache.values())
+          .map(({ fileHash, fileName, contentType, fileSize, timestamp }) => ({
+            fileHash, fileName, contentType, fileSize, timestamp
+          }));
+        res.json({ files });
+      } catch (error: any) {
+        res.status(500).json({ error: error.message });
       }
-
-      provider.ws.send(
-        JSON.stringify({
-          type: 'REQUEST_CHUNK_PROOF',
-          chunkHash,
-        })
-      );
-
-      return res.json({ message: `Challenge sent to ${providerId} for chunk ${chunkHash}` });
     });
 
     return new Promise<void>((resolve) => {
-      app.listen(this.apiPort, () => {
-        logger.info(`API server listening on port ${this.apiPort}`);
-        resolve();
-      });
+      app.listen(this.apiPort, () => resolve());
     });
   }
 
-  /**
-   * Send chunk data to providers (no local storage)
-   */
-  private instructProvidersToStoreChunk(chunkHash: string, chunkData: Buffer) {
-    // For simplicity, we send the chunk to all online providers
-    // Or pick a subset if you want
-    const onlineProviders = Array.from(this.providers.values()).filter((p) => p.isOnline);
+  private hasEnoughProviders(): boolean {
+    const onlineCount = Array.from(this.providers.values())
+      .filter(p => p.isOnline).length;
+    return onlineCount >= this.minProviderCount;
+  }
 
-    // In real logic, you might pick only 2 or 3
-    onlineProviders.forEach((provider) => {
-      provider.assignedChunks.add(chunkHash);
-      provider.ws.send(
-        JSON.stringify({
+  private async handleUpload(req: express.Request) {
+    const results = [];
+    
+    if (req.files && Array.isArray(req.files)) {
+      for (const file of req.files as Express.Multer.File[]) {
+        const result = await this.processFile(file);
+        results.push(result);
+      }
+    } else if (req.body && req.body.data) {
+      const result = await this.processTextData(req.body.data);
+      results.push(result);
+    }
+    
+    return results;
+  }
+
+  private async processFile(file: Express.Multer.File) {
+    const fileHash = generateRandomHash();
+    const chunks = chunkBuffer(file.buffer, 64 * 1024);
+    const chunkHashes = chunks.map(chunk => generateHash(chunk));
+    
+    const { root: merkleRoot } = buildMerkleTree(chunkHashes);
+    
+    const metadata: FileMeta = {
+      fileHash,
+      merkleRoot,
+      chunkHashes,
+      fileName: file.originalname,
+      contentType: file.mimetype,
+      fileSize: file.size,
+      timestamp: Date.now(),
+      providerIds: []
+    };
+
+    await this.distributeChunks(chunks, chunkHashes, metadata);
+    return metadata;
+  }
+
+  private async processTextData(text: string) {
+    const buffer = Buffer.from(text);
+    const fileHash = generateRandomHash();
+    const chunks = chunkBuffer(buffer, 64 * 1024);
+    const chunkHashes = chunks.map(chunk => generateHash(chunk));
+    
+    const { root: merkleRoot } = buildMerkleTree(chunkHashes);
+    
+    const metadata: FileMeta = {
+      fileHash,
+      merkleRoot,
+      chunkHashes,
+      fileName: 'text.txt',
+      contentType: 'text/plain',
+      fileSize: buffer.length,
+      timestamp: Date.now(),
+      providerIds: []
+    };
+
+    await this.distributeChunks(chunks, chunkHashes, metadata);
+    return metadata;
+  }
+
+  private async distributeChunks(chunks: Buffer[], chunkHashes: string[], metadata: FileMeta) {
+    const onlineProviders = Array.from(this.providers.values())
+      .filter(p => p.isOnline);
+    
+    const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
+    metadata.providerIds = targetProviders.map(p => p.id);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const chunkHash = chunkHashes[i];
+
+      targetProviders.forEach(provider => {
+        provider.storedHashes.add(chunkHash);
+        provider.metadata.set(metadata.fileHash, metadata);
+        
+        provider.ws.send(JSON.stringify({
           type: 'STORE_CHUNK',
           chunkHash,
-          data: chunkData.toString('hex'),
-        })
-      );
-    });
+          data: chunk.toString('hex'),
+          metadata
+        }));
+      });
+    }
+
+    this.metadataCache.set(metadata.fileHash, metadata);
   }
 
-  /**
-   * Request chunk data from providers for reading
-   * Returns a single Buffer (all chunks concatenated)
-   */
-  private requestAllChunks(fileHash: string, chunkHashes: string[]): Promise<Buffer> {
-    return new Promise<Buffer>((resolve, reject) => {
-      // create a readRequest object
+  private async getFile(fileHash: string) {
+    const metadata = this.metadataCache.get(fileHash);
+    if (!metadata) return null;
+
+    const buffer = await this.assembleFile(fileHash, metadata.chunkHashes);
+    return { buffer, metadata };
+  }
+
+  private assembleFile(fileHash: string, chunkHashes: string[]): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
       const readReq: ReadRequest = {
         totalChunks: chunkHashes.length,
         chunksReceived: 0,
         chunkData: {},
         resolve,
-        reject,
+        reject
       };
 
-      // store it so we can track chunk arrivals
       this.readRequests.set(fileHash, readReq);
 
-      // broadcast chunk requests
-      const onlineProviders = Array.from(this.providers.values()).filter((p) => p.isOnline);
+      const onlineProviders = Array.from(this.providers.values())
+        .filter(p => p.isOnline);
+
       if (onlineProviders.length === 0) {
-        return reject(new Error('No providers online to retrieve chunks.'));
+        reject(new Error('No providers available'));
+        return;
       }
 
-      for (const ch of chunkHashes) {
-        // we ask all providers for each chunk, but presumably only one has it
-        // or multiple might, but as soon as we get it once, we can proceed
-        for (const provider of onlineProviders) {
-          provider.ws.send(
-            JSON.stringify({
+      chunkHashes.forEach(chunkHash => {
+        onlineProviders.forEach(provider => {
+          if (provider.storedHashes.has(chunkHash)) {
+            provider.ws.send(JSON.stringify({
               type: 'REQUEST_CHUNK_DATA',
               fileHash,
-              chunkHash: ch,
-            })
-          );
-        }
+              chunkHash
+            }));
+          }
+        });
+      });
+    });
+  }
+
+  private async handleProviderMessage(providerId: string, message: any) {
+    const provider = this.providers.get(providerId);
+    if (!provider) return;
+
+    switch (message.type) {
+      case 'SYNC_STATE':
+        provider.metadata = new Map(Object.entries(message.metadata));
+        provider.storedHashes = new Set(message.storedHashes);
+        provider.merkleRoot = message.merkleRoot;
+        this.updateMetadataCache(provider.metadata);
+        break;
+
+      case 'METADATA_UPDATE':
+        provider.metadata.set(message.fileHash, message.metadata);
+        this.metadataCache.set(message.fileHash, message.metadata);
+        this.broadcastToProviders({
+          type: 'SYNC_METADATA',
+          fileHash: message.fileHash,
+          metadata: message.metadata
+        }, [providerId]);
+        break;
+
+      case 'CHUNK_DATA':
+        await this.handleChunkData(message);
+        break;
+    }
+  }
+
+  private updateMetadataCache(providerMetadata: Map<string, FileMeta>) {
+    providerMetadata.forEach((meta, fileHash) => {
+      if (!this.metadataCache.has(fileHash)) {
+        this.metadataCache.set(fileHash, meta);
       }
     });
   }
 
-  /**
-   * Handle CHUNK_DATA from a Provider
-   * We'll see if the read request is in progress, store the chunk, and check if done
-   */
-  private async handleChunkData(providerId: string, msg: any) {
-    const { fileHash, chunkHash, dataHex } = msg;
-
-    // Check if there's a read request pending for this file
+  private async handleChunkData(message: any) {
+    const { fileHash, chunkHash, data } = message;
     const readReq = this.readRequests.get(fileHash);
-    if (!readReq) {
-      logger.warn(`Received CHUNK_DATA for fileHash=${fileHash}, but no read request in progress`);
-      return;
-    }
+    if (!readReq) return;
 
-    // If we already have that chunk, skip
-    if (readReq.chunkData[chunkHash]) {
-      return;
-    }
+    if (!readReq.chunkData[chunkHash]) {
+      const chunk = Buffer.from(data, 'hex');
+      readReq.chunkData[chunkHash] = chunk;
+      readReq.chunksReceived++;
 
-    const buf = Buffer.from(dataHex, 'hex');
-    readReq.chunkData[chunkHash] = buf;
-    readReq.chunksReceived++;
-
-    // Check if we've got all chunks
-    if (readReq.chunksReceived === readReq.totalChunks) {
-      // remove from map
-      this.readRequests.delete(fileHash);
-
-      // sort chunkData by the order in chunkHashes? 
-      // We didn't store the original order, so let's assume 
-      // the original logic is that chunkHashes are in the right order
-      const meta = await this.hashStore.retrieveFileMeta(fileHash);
-      if (!meta) {
-        readReq.reject(new Error('File metadata missing.'));
-        return;
-      }
-
-      const buffers: Buffer[] = [];
-      for (const ch of meta.chunkHashes) {
-        const cbuf = readReq.chunkData[ch];
-        if (!cbuf) {
-          readReq.reject(new Error(`Missing chunk data: ${ch}`));
+      if (readReq.chunksReceived === readReq.totalChunks) {
+        const metadata = this.metadataCache.get(fileHash);
+        if (!metadata) {
+          readReq.reject(new Error('File metadata missing'));
           return;
         }
-        buffers.push(cbuf);
-      }
 
-      const fileBuf = Buffer.concat(buffers);
-      readReq.resolve(fileBuf);
+        const buffers = metadata.chunkHashes
+          .map(hash => readReq.chunkData[hash]);
+        
+        if (buffers.some(b => !b)) {
+          readReq.reject(new Error('Missing chunks'));
+          return;
+        }
+
+        const fileBuffer = Buffer.concat(buffers);
+        this.readRequests.delete(fileHash);
+        readReq.resolve(fileBuffer);
+      }
     }
   }
 
-  /**
-   * Handle CHUNK_PROOF message (unchanged logic)
-   */
-  private async handleChunkProof(providerId: string, msg: any) {
-    const { chunkHash, proof, merkleRoot, encryptedHex } = msg;
-    logger.info(`CHUNK_PROOF from ${providerId} for chunk=${chunkHash} root=${merkleRoot}`);
-
-    await this.proofStore.storeProof(`${providerId}-${chunkHash}`, {
-      chunkHash,
-      proof,
-      merkleRoot,
-      encryptedHex,
-      timestamp: Date.now(),
+  private broadcastToProviders(message: any, excludeIds: string[] = []) {
+    this.providers.forEach((provider, id) => {
+      if (provider.isOnline && !excludeIds.includes(id)) {
+        provider.ws.send(JSON.stringify(message));
+      }
     });
-    logger.info(`Stored chunk proof => ${providerId}-${chunkHash}`);
   }
 
-  /**
-   * Random chunk challenge
-   * (But we don't store anything locally, so we might not know about chunk hashes unless we track them in file metadata)
-   */
-  private async issueRandomChunkChallenge() {
-    try {
-      // For demonstration, let's pick a random file from hashStore, then a random chunk
-      const allFiles = await this.hashStore.getAllFileMetaKeys();
-      if (allFiles.length === 0) {
-        logger.info('No files in metadata, skipping random challenge.');
-        return;
-      }
-      const randomFile = allFiles[Math.floor(Math.random() * allFiles.length)];
-      const meta = await this.hashStore.retrieveFileMeta(randomFile);
-      if (!meta || !meta.chunkHashes || meta.chunkHashes.length === 0) {
-        logger.info(`File ${randomFile} has no chunks, skipping challenge.`);
-        return;
-      }
-      const randomChunk = meta.chunkHashes[Math.floor(Math.random() * meta.chunkHashes.length)];
-
-      // pick an online provider
-      const onlineProviders = Array.from(this.providers.values()).filter((p) => p.isOnline);
-      if (onlineProviders.length === 0) {
-        logger.info('No online providers to challenge.');
-        return;
-      }
-      const chosen = onlineProviders[Math.floor(Math.random() * onlineProviders.length)];
-
-      logger.info(`Issuing random challenge => ${chosen.id} for chunk=${randomChunk}`);
-      chosen.ws.send(
-        JSON.stringify({
-          type: 'REQUEST_CHUNK_PROOF',
-          chunkHash: randomChunk,
-        })
-      );
-    } catch (err) {
-      logger.error('Error in issueRandomChunkChallenge:', err);
+  private async syncProviderState(newProvider: ProviderInfo) {
+    const activeProvider = Array.from(this.providers.values())
+      .find(p => p.isOnline && p.id !== newProvider.id);
+    
+    if (activeProvider) {
+      activeProvider.ws.send(JSON.stringify({
+        type: 'REQUEST_SYNC',
+        targetProviderId: newProvider.id
+      }));
     }
   }
 }

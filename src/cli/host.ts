@@ -21,7 +21,7 @@ export function hostCommand() {
         apiPort = await getAvailablePort(3001);
       }
 
-      const server = new HostServer(bootPort, apiPort, opts.dbDir);
+      const server = new HostServer(bootPort, apiPort);
       await server.start();
 
       logger.info(`Host started (bootPort=${bootPort}, apiPort=${apiPort}, dbDir=${opts.dbDir})`);

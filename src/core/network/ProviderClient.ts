@@ -1,194 +1,308 @@
+// provider-client.ts
+
 import WebSocket from 'ws';
-import { DataStore } from '../storage/DataStore';
-import { HashStore } from '../storage/HashStore';
-import { ProofStore } from '../storage/ProofStore';
+import crypto from 'crypto';
+import logger from '../utils/logger';
 import { generateHash } from '../utils/cryptoutils';
 import { buildMerkleTree, generateMerkleProof } from '../utils/merkleutils';
-import logger from '../utils/logger';
+
+interface FileMeta {
+  fileHash: string;
+  merkleRoot: string;
+  chunkHashes: string[];
+  fileName: string;
+  contentType: string;
+  fileSize: number;
+  timestamp: number;
+  providerIds: string[];
+}
 
 export class ProviderClient {
   private bootHost: string;
   private bootPort: number;
-
-  private dataStore: DataStore;
-  private hashStore: HashStore;
-  private proofStore: ProofStore;
-
+  private storageDir: string;
   private ws: WebSocket | null = null;
+  private reconnectTimeout: NodeJS.Timeout | null = null;
+  private syncInterval: NodeJS.Timeout | null = null;
+  private metadata: Map<string, FileMeta> = new Map();
+  private chunks: Map<string, Buffer> = new Map();
   private merkleRoot: string = '';
-  private merkleTree: any = null;
+  private connected: boolean = false;
+  private retryCount: number = 0;
+  private maxRetries: number = 10;
+  private retryDelay: number = 5000;
 
-  // Build new Merkle root every 10 min
-  private merkleIntervalMs = 10 * 60 * 1000;
-  private merkleIntervalId: NodeJS.Timeout | null = null;
-
-  constructor(bootHost: string, bootPort: number, dbDir: string) {
+  constructor(bootHost: string, bootPort: number, storageDir: string) {
     this.bootHost = bootHost;
     this.bootPort = bootPort;
-    this.dataStore = new DataStore(`${dbDir}/data`);
-    this.hashStore = new HashStore(`${dbDir}/hashes`);
-    this.proofStore = new ProofStore(`${dbDir}/proofs`);
+    this.storageDir = storageDir;
+    this.initStorage();
+  }
+
+  private initStorage() {
+    const fs = require('fs');
+    if (!fs.existsSync(this.storageDir)) {
+      fs.mkdirSync(this.storageDir, { recursive: true });
+    }
   }
 
   public async start() {
+    await this.loadStoredData();
     await this.connectToHost();
-    await this.buildAndSubmitMerkleRoot(); // initial Merkle root
-    this.merkleIntervalId = setInterval(() => {
-      this.buildAndSubmitMerkleRoot();
-    }, this.merkleIntervalMs);
-
-    logger.info(`ProviderClient started => host=${this.bootHost}, port=${this.bootPort}`);
+    this.startPeriodicSync();
   }
 
-  private connectToHost(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(`ws://${this.bootHost}:${this.bootPort}`);
+  public async stop() {
+    if (this.ws) {
+      this.ws.close();
+    }
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+    }
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+  }
 
-      this.ws.on('open', () => {
-        logger.info('Provider => connected to Host');
-        this.ws?.send(JSON.stringify({ type: 'REGISTER_PROVIDER' }));
-        resolve();
-      });
+  private async loadStoredData() {
+    try {
+      const fs = require('fs').promises;
+      const metadataPath = `${this.storageDir}/metadata.json`;
+      const chunksPath = `${this.storageDir}/chunks`;
 
-      this.ws.on('error', (err) => {
-        logger.error('Provider => error connecting to Host', err);
-        reject(err);
-      });
+      if (await fs.access(metadataPath).then(() => true).catch(() => false)) {
+        const data = await fs.readFile(metadataPath, 'utf8');
+        const parsed = JSON.parse(data);
+        this.metadata = new Map(Object.entries(parsed));
+      }
 
-      this.ws.on('message', async (message) => {
-        const msg = message.toString();
-        try {
-          const parsed = JSON.parse(msg);
-          switch (parsed.type) {
-            case 'STORE_CHUNK':
-              await this.handleStoreChunk(parsed);
-              break;
+      const files = await fs.readdir(chunksPath).catch(() => []);
+      for (const file of files) {
+        const chunkHash = file.replace('.chunk', '');
+        const data = await fs.readFile(`${chunksPath}/${file}`);
+        this.chunks.set(chunkHash, data);
+      }
 
-            case 'REQUEST_CHUNK_PROOF':
-              await this.handleRequestChunkProof(parsed);
-              break;
+      await this.updateMerkleRoot();
+    } catch (error) {
+      logger.error('Error loading stored data:', error);
+    }
+  }
 
-            case 'REQUEST_CHUNK_DATA':
-              await this.handleRequestChunkData(parsed);
-              break;
+  private async saveMetadata() {
+    try {
+      const fs = require('fs').promises;
+      const metadataPath = `${this.storageDir}/metadata.json`;
+      await fs.writeFile(
+        metadataPath,
+        JSON.stringify(Object.fromEntries(this.metadata))
+      );
+    } catch (error) {
+      logger.error('Error saving metadata:', error);
+    }
+  }
 
-            default:
-              logger.warn(`Unknown message from host: ${parsed.type}`);
-          }
-        } catch (e) {
-          logger.error('Provider => parse error from host message:', msg, e);
-        }
-      });
+  private async saveChunk(chunkHash: string, data: Buffer) {
+    try {
+      const fs = require('fs').promises;
+      const chunksPath = `${this.storageDir}/chunks`;
+      await fs.mkdir(chunksPath, { recursive: true });
+      await fs.writeFile(`${chunksPath}/${chunkHash}.chunk`, data);
+    } catch (error) {
+      logger.error('Error saving chunk:', error);
+    }
+  }
+
+  private async updateMerkleRoot() {
+    const chunkHashes = Array.from(this.chunks.keys()).sort();
+    if (chunkHashes.length === 0) {
+      this.merkleRoot = '';
+      return;
+    }
+    const { root } = buildMerkleTree(chunkHashes);
+    this.merkleRoot = root;
+  }
+
+  private startPeriodicSync() {
+    this.syncInterval = setInterval(() => {
+      if (this.connected) {
+        this.syncState();
+      }
+    }, 5 * 60 * 1000);
+  }
+
+  private async connectToHost() {
+    if (this.ws) {
+      this.ws.terminate();
+    }
+
+    this.ws = new WebSocket(`ws://${this.bootHost}:${this.bootPort}`);
+
+    this.ws.on('open', () => {
+      this.connected = true;
+      this.retryCount = 0;
+      logger.info('Connected to host');
+      this.syncState();
+    });
+
+    this.ws.on('message', async (message) => {
+      try {
+        const msg = JSON.parse(message.toString());
+        await this.handleHostMessage(msg);
+      } catch (error) {
+        logger.error('Error handling host message:', error);
+      }
+    });
+
+    this.ws.on('close', () => {
+      this.connected = false;
+      this.handleDisconnect();
+    });
+
+    this.ws.on('error', (error) => {
+      logger.error('WebSocket error:', error);
+      this.connected = false;
+      this.handleDisconnect();
+    });
+
+    this.ws.on('ping', () => {
+      this.ws?.pong();
     });
   }
 
-  private async buildAndSubmitMerkleRoot() {
-    try {
-      const allHashes = await this.dataStore.getAllKeys();
-      if (allHashes.length === 0) {
-        this.merkleRoot = '';
-        this.ws?.send(
-          JSON.stringify({
-            type: 'MERKLE_UPDATE',
-            root: this.merkleRoot,
-            timestamp: Date.now(),
-          })
-        );
-        logger.info('No stored chunks => empty Merkle root');
-        return;
-      }
+  private handleDisconnect() {
+    if (this.retryCount >= this.maxRetries) {
+      logger.error('Max reconnection attempts reached');
+      return;
+    }
 
-      const { tree, root } = buildMerkleTree(allHashes);
-      this.merkleTree = tree;
-      this.merkleRoot = root;
+    this.retryCount++;
+    const delay = this.retryDelay * Math.pow(2, this.retryCount - 1);
+    
+    this.reconnectTimeout = setTimeout(() => {
+      logger.info(`Attempting reconnection (${this.retryCount}/${this.maxRetries})`);
+      this.connectToHost();
+    }, delay);
+  }
 
-      this.ws?.send(
-        JSON.stringify({
-          type: 'MERKLE_UPDATE',
-          root: this.merkleRoot,
-          timestamp: Date.now(),
-        })
-      );
+  private async syncState() {
+    if (!this.ws || !this.connected) return;
 
-      logger.info(`Provider => MERKLE_UPDATE => ${this.merkleRoot}`);
-    } catch (err) {
-      logger.error('Error building Merkle root:', err);
+    this.ws.send(JSON.stringify({
+      type: 'SYNC_STATE',
+      metadata: Object.fromEntries(this.metadata),
+      storedHashes: Array.from(this.chunks.keys()),
+      merkleRoot: this.merkleRoot
+    }));
+  }
+
+  private async handleHostMessage(message: any) {
+    switch (message.type) {
+      case 'STORE_CHUNK':
+        await this.handleStoreChunk(message);
+        break;
+
+      case 'REQUEST_CHUNK_DATA':
+        await this.handleChunkRequest(message);
+        break;
+
+      case 'REQUEST_CHUNK_PROOF':
+        await this.handleChunkProof(message);
+        break;
+
+      case 'SYNC_METADATA':
+        await this.handleMetadataSync(message);
+        break;
+
+      case 'REQUEST_SYNC':
+        this.syncState();
+        break;
     }
   }
 
-  /**
-   * Handle chunk storage from the host
-   */
-  private async handleStoreChunk(parsed: any) {
-    const { chunkHash, data } = parsed;
-    const rawBuf = Buffer.from(data, 'hex');
+  private async handleStoreChunk(message: any) {
+    const { chunkHash, data, metadata } = message;
+    const buffer = Buffer.from(data, 'hex');
 
-    // verify chunk hash
-    const computed = generateHash(rawBuf);  // Use the deterministic version
-    if (computed !== chunkHash) {
-      logger.error(`Hash mismatch => expected=${chunkHash}, got=${computed}`);
+    // Verify chunk hash
+    const computedHash = generateHash(buffer);
+    if (computedHash !== chunkHash) {
+      logger.error(`Hash verification failed for chunk ${chunkHash}`);
       return;
     }
 
-    await this.dataStore.storeData(chunkHash, rawBuf);
-    logger.info(`Provider => stored chunk ${chunkHash}`);
+    this.chunks.set(chunkHash, buffer);
+    await this.saveChunk(chunkHash, buffer);
 
-    // optionally rebuild Merkle
-    // await this.buildAndSubmitMerkleRoot();
+    if (metadata) {
+      this.metadata.set(metadata.fileHash, metadata);
+      await this.saveMetadata();
+    }
+
+    await this.updateMerkleRoot();
+    this.broadcastMetadataUpdate(metadata);
   }
 
-  /**
-   * The host is asking for a chunk proof
-   */
-  private async handleRequestChunkProof(parsed: any) {
-    const { chunkHash } = parsed;
-    const chunkBuf = await this.dataStore.retrieveData(chunkHash);
-    if (!chunkBuf) {
-      logger.warn(`Provider => missing chunk ${chunkHash}, cannot prove`);
-      return;
-    }
-    if (!this.merkleTree) {
-      logger.warn('No merkle tree built yet, skipping proof');
-      return;
-    }
+  private async handleChunkRequest(message: any) {
+    const { fileHash, chunkHash } = message;
+    const chunk = this.chunks.get(chunkHash);
 
-    const proof = generateMerkleProof(this.merkleTree, chunkHash);
-
-    this.ws?.send(
-      JSON.stringify({
-        type: 'CHUNK_PROOF',
-        chunkHash,
-        proof,
-        merkleRoot: this.merkleRoot,
-        // We'll still call it "encryptedHex", but it's just raw data
-        encryptedHex: chunkBuf.toString('hex'),
-      })
-    );
-
-    logger.info(`Provider => CHUNK_PROOF for ${chunkHash}`);
-  }
-
-  /**
-   * The host wants the chunk data for reassembly
-   */
-  private async handleRequestChunkData(parsed: any) {
-    const { fileHash, chunkHash } = parsed;
-    const chunkBuf = await this.dataStore.retrieveData(chunkHash);
-    if (!chunkBuf) {
-      logger.warn(`Provider => missing chunk ${chunkHash}, cannot return data`);
-      return;
-    }
-
-    // Send chunk data back
-    this.ws?.send(
-      JSON.stringify({
+    if (chunk) {
+      this.ws?.send(JSON.stringify({
         type: 'CHUNK_DATA',
         fileHash,
         chunkHash,
-        dataHex: chunkBuf.toString('hex'),
-      })
-    );
+        data: chunk.toString('hex')
+      }));
+    }
+  }
 
-    logger.info(`Provider => CHUNK_DATA for ${chunkHash}, file=${fileHash}`);
+  private async handleChunkProof(message: any) {
+    const { chunkHash } = message;
+    const chunk = this.chunks.get(chunkHash);
+
+    if (!chunk) {
+      logger.warn(`Chunk not found: ${chunkHash}`);
+      return;
+    }
+
+    const allHashes = Array.from(this.chunks.keys()).sort();
+    const { tree, root } = buildMerkleTree(allHashes);
+    const proof = generateMerkleProof(tree, chunkHash);
+
+    this.ws?.send(JSON.stringify({
+      type: 'CHUNK_PROOF',
+      chunkHash,
+      proof,
+      merkleRoot: root,
+      data: chunk.toString('hex')
+    }));
+  }
+
+  private async handleMetadataSync(message: any) {
+    const { fileHash, metadata } = message;
+    this.metadata.set(fileHash, metadata);
+    await this.saveMetadata();
+  }
+
+  private broadcastMetadataUpdate(metadata: FileMeta) {
+    if (!this.ws || !this.connected) return;
+
+    this.ws.send(JSON.stringify({
+      type: 'METADATA_UPDATE',
+      fileHash: metadata.fileHash,
+      metadata
+    }));
+  }
+
+  public getStats() {
+    return {
+      totalChunks: this.chunks.size,
+      totalFiles: this.metadata.size,
+      merkleRoot: this.merkleRoot,
+      connected: this.connected,
+      storageSize: Array.from(this.chunks.values())
+        .reduce((acc, chunk) => acc + chunk.length, 0)
+    };
   }
 }

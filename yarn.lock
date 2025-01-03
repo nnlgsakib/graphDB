@@ -1155,6 +1155,13 @@ normalize-path@^3.0.0, normalize-path@~3.0.0:
   resolved "https://registry.npmjs.org/normalize-path/-/normalize-path-3.0.0.tgz"
   integrity sha512-6eZs5Ls3WtCisHWp9S2GUy8dqkpGi4BVSz3GaqiE6ezub0512ESztXUwUB6C6IKbQkY2Pnb/mD4WYojCRwcwLA==
 
+nulldot.js@^0.1.6, nulldot.js@^0.1.7:
+  version "0.1.7"
+  resolved "https://registry.npmjs.org/nulldot.js/-/nulldot.js-0.1.7.tgz"
+  integrity sha512-XfyWmsHDxvKhYiThwmE/2KiRFw1wFm+crn5pNDhB/DlTlAxH5et9LNrBToADc5hp0HpTOs/hXVFjQSjy8D5NWA==
+  dependencies:
+    nulldot.js "^0.1.6"
+
 object-assign@^4, object-assign@^4.1.1:
   version "4.1.1"
   resolved "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz"
