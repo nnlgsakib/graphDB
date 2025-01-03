@@ -1,8 +1,0 @@
-2025-01-03T10:26:54.603Z [INFO] 🔍 DataStore init: ./db-provider/data 
-2025-01-03T10:26:54.612Z [INFO] 🔍 HashStore init: ./db-provider/hashes 
-2025-01-03T10:26:54.612Z [INFO] 🔍 ProofStore init: ./db-provider/proofs 
-2025-01-03T10:26:54.625Z [INFO] 🔍 Provider => connected to Host 
-2025-01-03T10:26:54.627Z [INFO] 🔍 No stored chunks => empty Merkle root 
-2025-01-03T10:26:54.628Z [INFO] 🔍 ProviderClient started => host=localhost, port=5000 
-2025-01-03T10:26:54.628Z [INFO] 🔍 Provider started (host=localhost, port=5000, dbDir=./db-provider) 
-2025-01-03T10:28:43.783Z [INFO] 🔍 Provider => stored chunk nlg3fe019803c1300495 
