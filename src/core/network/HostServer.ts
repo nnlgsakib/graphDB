@@ -6,25 +6,14 @@ import multer from 'multer';
 import logger from '../utils/logger';
 import { generateHash, generateRandomHash, chunkBuffer } from '../utils/cryptoutils';
 import { buildMerkleTree } from '../utils/merkleutils';
+import { HashStore, FileMeta } from './../storage/HashStore';
 
 interface ProviderInfo {
   id: string;
   ws: WebSocket;
   isOnline: boolean;
   merkleRoot: string | null;
-  storedHashes: Set<string>;
-  metadata: Map<string, FileMeta>;
-}
-
-interface FileMeta {
-  fileHash: string;
-  merkleRoot: string;
-  chunkHashes: string[];
-  fileName: string;
-  contentType: string;
-  fileSize: number;
-  timestamp: number;
-  providerIds: string[];
+  storedChunks: Set<string>;
 }
 
 interface ReadRequest {
@@ -49,11 +38,12 @@ export class HostServer {
   private minProviderCount = 3;
   private replicationFactor = 3;
   private healthCheckInterval: NodeJS.Timeout | null = null;
-  private metadataCache: Map<string, FileMeta> = new Map();
+  private hashStore: HashStore;
 
-  constructor(bootPort: number, apiPort: number) {
+  constructor(bootPort: number, apiPort: number, storagePath: string) {
     this.bootPort = bootPort;
     this.apiPort = apiPort;
+    this.hashStore = new HashStore(`${storagePath}/hashes`);
   }
 
   public async start() {
@@ -82,9 +72,6 @@ export class HostServer {
   }
 
   private async redistributeProviderData(failedProviderId: string) {
-    const failedProvider = this.providers.get(failedProviderId);
-    if (!failedProvider) return;
-
     const onlineProviders = Array.from(this.providers.values())
       .filter(p => p.isOnline && p.id !== failedProviderId);
     
@@ -93,17 +80,43 @@ export class HostServer {
       return;
     }
 
-    failedProvider.metadata.forEach((meta, fileHash) => {
-      const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
-      targetProviders.forEach(provider => {
-        provider.metadata.set(fileHash, meta);
-        provider.ws.send(JSON.stringify({
-          type: 'SYNC_METADATA',
-          fileHash,
-          metadata: meta
-        }));
+    const allHashes = await this.hashStore.getAllFileMetaKeys();
+    for (const fileHash of allHashes) {
+      const meta = await this.hashStore.retrieveFileMeta(fileHash);
+      if (!meta) continue;
+
+      Object.keys(meta.chunkProviders).forEach(chunkHash => {
+        meta.chunkProviders[chunkHash] = meta.chunkProviders[chunkHash]
+          .filter(id => id !== failedProviderId);
       });
-    });
+
+      const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
+      Object.keys(meta.chunkProviders).forEach(chunkHash => {
+        const currentProviders = meta.chunkProviders[chunkHash];
+        const neededProviders = this.replicationFactor - currentProviders.length;
+        
+        if (neededProviders > 0) {
+          const newProviders = targetProviders
+            .filter(p => !currentProviders.includes(p.id))
+            .slice(0, neededProviders)
+            .map(p => p.id);
+
+          meta.chunkProviders[chunkHash].push(...newProviders);
+
+          // Request chunk redistribution from existing providers
+          const existingProvider = this.providers.get(currentProviders[0]);
+          if (existingProvider) {
+            existingProvider.ws.send(JSON.stringify({
+              type: 'REDISTRIBUTE_CHUNK',
+              chunkHash,
+              targetProviders: newProviders
+            }));
+          }
+        }
+      });
+
+      await this.hashStore.storeFileMeta(fileHash, meta);
+    }
   }
 
   private selectProviders(providers: ProviderInfo[], count: number): ProviderInfo[] {
@@ -123,14 +136,11 @@ export class HostServer {
         ws,
         isOnline: true,
         merkleRoot: null,
-        storedHashes: new Set(),
-        metadata: new Map()
+        storedChunks: new Set()
       };
       
       this.providers.set(providerId, provider);
       logger.info(`Provider connected => ${providerId}`);
-
-      this.syncProviderState(provider);
 
       ws.on('message', async (message) => {
         try {
@@ -190,8 +200,8 @@ export class HostServer {
 
         const { buffer, metadata } = file;
         
-        if (INLINE_MIME_TYPES.has(metadata.contentType)) {
-          res.setHeader('Content-Type', metadata.contentType);
+        if (INLINE_MIME_TYPES.has(metadata.contentType!)) {
+          res.setHeader('Content-Type', metadata.contentType!);
           res.send(buffer);
         } else {
           res.setHeader('Content-Type', 'application/octet-stream');
@@ -206,10 +216,18 @@ export class HostServer {
 
     app.get('/files', async (req, res) => {
       try {
-        const files = Array.from(this.metadataCache.values())
-          .map(({ fileHash, fileName, contentType, fileSize, timestamp }) => ({
-            fileHash, fileName, contentType, fileSize, timestamp
-          }));
+        const fileHashes = await this.hashStore.getAllFileMetaKeys();
+        const files = await Promise.all(
+          fileHashes.map(async hash => {
+            const meta = await this.hashStore.retrieveFileMeta(hash);
+            return {
+              fileHash: hash,
+              fileName: meta?.fileName,
+              contentType: meta?.contentType,
+              fileSize: meta?.fileSize
+            };
+          })
+        );
         res.json({ files });
       } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -254,11 +272,10 @@ export class HostServer {
       fileHash,
       merkleRoot,
       chunkHashes,
+      chunkProviders: {},
       fileName: file.originalname,
       contentType: file.mimetype,
-      fileSize: file.size,
-      timestamp: Date.now(),
-      providerIds: []
+      fileSize: file.size
     };
 
     await this.distributeChunks(chunks, chunkHashes, metadata);
@@ -277,11 +294,10 @@ export class HostServer {
       fileHash,
       merkleRoot,
       chunkHashes,
+      chunkProviders: {},
       fileName: 'text.txt',
       contentType: 'text/plain',
-      fileSize: buffer.length,
-      timestamp: Date.now(),
-      providerIds: []
+      fileSize: buffer.length
     };
 
     await this.distributeChunks(chunks, chunkHashes, metadata);
@@ -293,16 +309,16 @@ export class HostServer {
       .filter(p => p.isOnline);
     
     const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
-    metadata.providerIds = targetProviders.map(p => p.id);
+    const providerIds = targetProviders.map(p => p.id);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const chunkHash = chunkHashes[i];
 
+      metadata.chunkProviders[chunkHash] = providerIds;
+
       targetProviders.forEach(provider => {
-        provider.storedHashes.add(chunkHash);
-        provider.metadata.set(metadata.fileHash, metadata);
-        
+        provider.storedChunks.add(chunkHash);
         provider.ws.send(JSON.stringify({
           type: 'STORE_CHUNK',
           chunkHash,
@@ -312,21 +328,21 @@ export class HostServer {
       });
     }
 
-    this.metadataCache.set(metadata.fileHash, metadata);
+    await this.hashStore.storeFileMeta(metadata.fileHash, metadata);
   }
 
   private async getFile(fileHash: string) {
-    const metadata = this.metadataCache.get(fileHash);
+    const metadata = await this.hashStore.retrieveFileMeta(fileHash);
     if (!metadata) return null;
 
-    const buffer = await this.assembleFile(fileHash, metadata.chunkHashes);
+    const buffer = await this.assembleFile(fileHash, metadata);
     return { buffer, metadata };
   }
 
-  private assembleFile(fileHash: string, chunkHashes: string[]): Promise<Buffer> {
+  private assembleFile(fileHash: string, metadata: FileMeta): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const readReq: ReadRequest = {
-        totalChunks: chunkHashes.length,
+        totalChunks: metadata.chunkHashes.length,
         chunksReceived: 0,
         chunkData: {},
         resolve,
@@ -335,24 +351,21 @@ export class HostServer {
 
       this.readRequests.set(fileHash, readReq);
 
-      const onlineProviders = Array.from(this.providers.values())
-        .filter(p => p.isOnline);
+      metadata.chunkHashes.forEach((chunkHash) => {
+        const providers = metadata.chunkProviders[chunkHash] || [];
+        const availableProvider = providers
+          .map(id => this.providers.get(id))
+          .find(p => p && p.isOnline && p.storedChunks.has(chunkHash));
 
-      if (onlineProviders.length === 0) {
-        reject(new Error('No providers available'));
-        return;
-      }
-
-      chunkHashes.forEach(chunkHash => {
-        onlineProviders.forEach(provider => {
-          if (provider.storedHashes.has(chunkHash)) {
-            provider.ws.send(JSON.stringify({
-              type: 'REQUEST_CHUNK_DATA',
-              fileHash,
-              chunkHash
-            }));
-          }
-        });
+        if (availableProvider) {
+          availableProvider.ws.send(JSON.stringify({
+            type: 'REQUEST_CHUNK',
+            fileHash,
+            chunkHash
+          }));
+        } else {
+          readReq.reject(new Error(`No available provider for chunk ${chunkHash}`));
+        }
       });
     });
   }
@@ -362,35 +375,18 @@ export class HostServer {
     if (!provider) return;
 
     switch (message.type) {
-      case 'SYNC_STATE':
-        provider.metadata = new Map(Object.entries(message.metadata));
-        provider.storedHashes = new Set(message.storedHashes);
-        provider.merkleRoot = message.merkleRoot;
-        this.updateMetadataCache(provider.metadata);
-        break;
-
-      case 'METADATA_UPDATE':
-        provider.metadata.set(message.fileHash, message.metadata);
-        this.metadataCache.set(message.fileHash, message.metadata);
-        this.broadcastToProviders({
-          type: 'SYNC_METADATA',
-          fileHash: message.fileHash,
-          metadata: message.metadata
-        }, [providerId]);
-        break;
-
       case 'CHUNK_DATA':
         await this.handleChunkData(message);
         break;
-    }
-  }
 
-  private updateMetadataCache(providerMetadata: Map<string, FileMeta>) {
-    providerMetadata.forEach((meta, fileHash) => {
-      if (!this.metadataCache.has(fileHash)) {
-        this.metadataCache.set(fileHash, meta);
-      }
-    });
+      case 'MERKLE_ROOT':
+        provider.merkleRoot = message.root;
+        break;
+
+      case 'SYNC_STATE':
+        provider.storedChunks = new Set(message.storedChunks);
+        break;
+    }
   }
 
   private async handleChunkData(message: any) {
@@ -404,7 +400,7 @@ export class HostServer {
       readReq.chunksReceived++;
 
       if (readReq.chunksReceived === readReq.totalChunks) {
-        const metadata = this.metadataCache.get(fileHash);
+        const metadata = await this.hashStore.retrieveFileMeta(fileHash);
         if (!metadata) {
           readReq.reject(new Error('File metadata missing'));
           return;
@@ -422,26 +418,6 @@ export class HostServer {
         this.readRequests.delete(fileHash);
         readReq.resolve(fileBuffer);
       }
-    }
-  }
-
-  private broadcastToProviders(message: any, excludeIds: string[] = []) {
-    this.providers.forEach((provider, id) => {
-      if (provider.isOnline && !excludeIds.includes(id)) {
-        provider.ws.send(JSON.stringify(message));
-      }
-    });
-  }
-
-  private async syncProviderState(newProvider: ProviderInfo) {
-    const activeProvider = Array.from(this.providers.values())
-      .find(p => p.isOnline && p.id !== newProvider.id);
-    
-    if (activeProvider) {
-      activeProvider.ws.send(JSON.stringify({
-        type: 'REQUEST_SYNC',
-        targetProviderId: newProvider.id
-      }));
     }
   }
 }

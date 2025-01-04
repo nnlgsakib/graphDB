@@ -13,6 +13,7 @@ export function hostCommand() {
     .action(async (opts) => {
       let bootPort = parseInt(opts.bootPort, 10);
       let apiPort = parseInt(opts.apiPort, 10);
+      let dbDir = opts.dbDir;
 
       if (Number.isNaN(bootPort)) {
         bootPort = await getAvailablePort(3000);
@@ -21,7 +22,7 @@ export function hostCommand() {
         apiPort = await getAvailablePort(3001);
       }
 
-      const server = new HostServer(bootPort, apiPort);
+      const server = new HostServer(bootPort, apiPort,dbDir);
       await server.start();
 
       logger.info(`Host started (bootPort=${bootPort}, apiPort=${apiPort}, dbDir=${opts.dbDir})`);

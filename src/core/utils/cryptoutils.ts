@@ -6,7 +6,7 @@ import crypto from 'crypto';
  */
 export function generateRandomHash(): string {
   const randomHex = crypto.randomBytes(32).toString('hex'); // 64 hex chars
-  return `nlg${randomHex}`;
+  return `nlg${randomHex}`.slice(0, 35); // Trim to 64 chars
 }
 
 /**
@@ -16,7 +16,7 @@ export function generateRandomHash(): string {
  */
 export function generateHash(data: string | Buffer): string {
   const shaPart = crypto.createHash('sha256').update(data).digest('hex');
-  return `nlg${shaPart}`;
+  return `nlg${shaPart}`.slice(0, 35);
 }
 
 /**
