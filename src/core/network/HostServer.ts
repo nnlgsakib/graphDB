@@ -1,3 +1,4 @@
+
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
@@ -10,10 +11,12 @@ import { HashStore, FileMeta } from './../storage/HashStore';
 
 interface ProviderInfo {
   id: string;
+  name: string;  // Added name field
   ws: WebSocket;
   isOnline: boolean;
   merkleRoot: string | null;
   storedChunks: Set<string>;
+  knownMetadata: Set<string>; // Track which file metadata this provider knows about
 }
 
 interface ReadRequest {
@@ -52,7 +55,13 @@ export class HostServer {
     this.startHealthCheck();
     logger.info(`HostServer up => bootPort=${this.bootPort}, apiPort=${this.apiPort}`);
   }
-
+  private generateProviderId(providedName?: string): string {
+    if (providedName) {
+      return providedName;
+    }
+    // Generate a short SHA-256 hash (first 8 characters)
+    return generateRandomHash().substring(0, 8);
+  }
   private startHealthCheck() {
     this.healthCheckInterval = setInterval(() => {
       this.providers.forEach((provider, id) => {
@@ -74,37 +83,31 @@ export class HostServer {
   private async redistributeProviderData(failedProviderId: string) {
     const onlineProviders = Array.from(this.providers.values())
       .filter(p => p.isOnline && p.id !== failedProviderId);
-    
+  
     if (onlineProviders.length < this.minProviderCount) {
       logger.error('Not enough providers for redistribution');
       return;
     }
-
+  
     const allHashes = await this.hashStore.getAllFileMetaKeys();
+    const loggedRedistributions = new Set<string>();
+  
     for (const fileHash of allHashes) {
       const meta = await this.hashStore.retrieveFileMeta(fileHash);
       if (!meta) continue;
-
+  
       Object.keys(meta.chunkProviders).forEach(chunkHash => {
-        meta.chunkProviders[chunkHash] = meta.chunkProviders[chunkHash]
-          .filter(id => id !== failedProviderId);
-      });
-
-      const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
-      Object.keys(meta.chunkProviders).forEach(chunkHash => {
-        const currentProviders = meta.chunkProviders[chunkHash];
-        const neededProviders = this.replicationFactor - currentProviders.length;
-        
-        if (neededProviders > 0) {
-          const newProviders = targetProviders
-            .filter(p => !currentProviders.includes(p.id))
-            .slice(0, neededProviders)
-            .map(p => p.id);
-
-          meta.chunkProviders[chunkHash].push(...newProviders);
-
-          // Request chunk redistribution from existing providers
-          const existingProvider = this.providers.get(currentProviders[0]);
+        if (!loggedRedistributions.has(`${chunkHash}-${failedProviderId}`)) {
+          meta.chunkProviders[chunkHash] = meta.chunkProviders[chunkHash]
+            .filter(id => id !== failedProviderId);
+  
+          const targetProviders = this.selectProviders(onlineProviders, this.replicationFactor);
+          const newProviders = targetProviders.map(p => p.id);
+  
+          logger.info(`Redistributing chunk ${chunkHash} from failed provider ${failedProviderId} to providers: ${newProviders.join(', ')}`);
+          loggedRedistributions.add(`${chunkHash}-${failedProviderId}`);
+  
+          const existingProvider = this.providers.get(meta.chunkProviders[chunkHash][0]);
           if (existingProvider) {
             existingProvider.ws.send(JSON.stringify({
               type: 'REDISTRIBUTE_CHUNK',
@@ -114,10 +117,11 @@ export class HostServer {
           }
         }
       });
-
+  
       await this.hashStore.storeFileMeta(fileHash, meta);
     }
   }
+  
 
   private selectProviders(providers: ProviderInfo[], count: number): ProviderInfo[] {
     return providers
@@ -130,35 +134,54 @@ export class HostServer {
     const wss = new WebSocket.Server({ server });
 
     wss.on('connection', (ws) => {
-      const providerId = `provider-${++this.providerCounter}`;
-      const provider: ProviderInfo = {
-        id: providerId,
-        ws,
-        isOnline: true,
-        merkleRoot: null,
-        storedChunks: new Set()
-      };
-      
-      this.providers.set(providerId, provider);
-      logger.info(`Provider connected => ${providerId}`);
-
-      ws.on('message', async (message) => {
+      ws.once('message', async (message) => {
         try {
-          const data = JSON.parse(message.toString());
-          await this.handleProviderMessage(providerId, data);
+          const initialData = JSON.parse(message.toString());
+          const providerId = this.generateProviderId(initialData.providerName);
+          
+          const provider: ProviderInfo = {
+            id: providerId,
+            name: initialData.providerName || providerId,
+            ws,
+            isOnline: true,
+            merkleRoot: null,
+            storedChunks: new Set(),
+            knownMetadata: new Set()
+          };
+          
+          this.providers.set(providerId, provider);
+          logger.info(`Provider connected => ${provider.name} (${providerId})`);
+
+          // If provider claims to have existing data, request sync
+          if (initialData.hasExistingData) {
+            ws.send(JSON.stringify({
+              type: 'REQUEST_SYNC',
+              fullSync: true
+            }));
+          }
+
+          ws.on('message', async (msg) => {
+            try {
+              const data = JSON.parse(msg.toString());
+              await this.handleProviderMessage(providerId, data);
+            } catch (error) {
+              logger.error('Error handling provider message:', error);
+            }
+          });
+
+          ws.on('close', () => {
+            provider.isOnline = false;
+            this.redistributeProviderData(providerId);
+          });
+
+          ws.on('error', (error) => {
+            logger.error(`WebSocket error for provider ${provider.name} (${providerId}):`, error);
+            provider.isOnline = false;
+          });
         } catch (error) {
-          logger.error('Error handling provider message:', error);
+          logger.error('Error handling initial provider connection:', error);
+          ws.close();
         }
-      });
-
-      ws.on('close', () => {
-        provider.isOnline = false;
-        this.redistributeProviderData(providerId);
-      });
-
-      ws.on('error', (error) => {
-        logger.error(`WebSocket error for provider ${providerId}:`, error);
-        provider.isOnline = false;
       });
     });
 
@@ -267,6 +290,12 @@ export class HostServer {
     const chunkHashes = chunks.map(chunk => generateHash(chunk));
     
     const { root: merkleRoot } = buildMerkleTree(chunkHashes);
+    if (merkleRoot) {
+      logger.info(`Generated Merkle Root: ${merkleRoot} for fileHash: ${fileHash}`);
+    } else {
+      logger.warn(`Failed to generate Merkle Root for fileHash: ${fileHash}`);
+    }
+    
     
     const metadata: FileMeta = {
       fileHash,
@@ -289,7 +318,13 @@ export class HostServer {
     const chunkHashes = chunks.map(chunk => generateHash(chunk));
     
     const { root: merkleRoot } = buildMerkleTree(chunkHashes);
+    if (merkleRoot) {
+      logger.info(`Generated Merkle Root: ${merkleRoot} for fileHash: ${fileHash}`);
+    } else {
+      logger.warn(`Failed to generate Merkle Root for fileHash: ${fileHash}`);
+    }
     
+
     const metadata: FileMeta = {
       fileHash,
       merkleRoot,
@@ -319,6 +354,7 @@ export class HostServer {
 
       targetProviders.forEach(provider => {
         provider.storedChunks.add(chunkHash);
+        logger.info(`Distributing chunk ${chunkHash} to providers: ${providerIds.join(', ')}`);
         provider.ws.send(JSON.stringify({
           type: 'STORE_CHUNK',
           chunkHash,
@@ -331,13 +367,59 @@ export class HostServer {
     await this.hashStore.storeFileMeta(metadata.fileHash, metadata);
   }
 
-  private async getFile(fileHash: string) {
+  private async getFile(fileHash: string):Promise<any | null> {
     const metadata = await this.hashStore.retrieveFileMeta(fileHash);
-    if (!metadata) return null;
+    if (!metadata) {
+      // Try to find metadata from connected providers
+      const foundMetadata = await this.searchMetadataFromProviders(fileHash);
+      if (!foundMetadata) return null;
+      await this.hashStore.storeFileMeta(fileHash, foundMetadata);
+      return this.getFile(fileHash);
+    }
 
     const buffer = await this.assembleFile(fileHash, metadata);
     return { buffer, metadata };
   }
+
+  private async searchMetadataFromProviders(fileHash: string): Promise<FileMeta | null> {
+    const onlineProviders = Array.from(this.providers.values())
+      .filter(p => p.isOnline);
+    
+    const metadataPromises = onlineProviders.map(provider => 
+      new Promise<FileMeta | null>((resolve) => {
+        const timeout = setTimeout(() => resolve(null), 5000);
+        
+        const handler = async (message: any) => {
+          try {
+            const data = JSON.parse(message.toString());
+            if (data.type === 'METADATA_RESPONSE' && data.fileHash === fileHash) {
+              clearTimeout(timeout);
+              provider.ws.removeListener('message', handler);
+              if (data.metadata) {
+                provider.knownMetadata.add(fileHash);
+                resolve(data.metadata);
+              } else {
+                resolve(null);
+              }
+            }
+          } catch (error) {
+            resolve(null);
+          }
+        };
+
+        provider.ws.on('message', handler);
+        provider.ws.send(JSON.stringify({
+          type: 'REQUEST_METADATA',
+          fileHash
+        }));
+      })
+    );
+
+    const results = await Promise.all(metadataPromises);
+    const validMetadata = results.find(meta => meta !== null);
+    return validMetadata || null;
+  }
+
 
   private assembleFile(fileHash: string, metadata: FileMeta): Promise<Buffer> {
     return new Promise((resolve, reject) => {
@@ -358,6 +440,7 @@ export class HostServer {
           .find(p => p && p.isOnline && p.storedChunks.has(chunkHash));
 
         if (availableProvider) {
+          logger.info(`Requesting chunk ${chunkHash} for fileHash: ${fileHash} from provider: ${availableProvider?.id}`);
           availableProvider.ws.send(JSON.stringify({
             type: 'REQUEST_CHUNK',
             fileHash,
@@ -369,28 +452,59 @@ export class HostServer {
       });
     });
   }
+  private async handleProviderSync(providerId: string, message: any) {
+    const provider = this.providers.get(providerId);
+    if (!provider) return;
+
+    provider.storedChunks = new Set(message.storedHashes);
+    
+    // Handle metadata sync
+    if (message.metadata) {
+      for (const [fileHash, meta] of Object.entries(message.metadata)) {
+        provider.knownMetadata.add(fileHash);
+        const existingMeta = await this.hashStore.retrieveFileMeta(fileHash);
+        if (!existingMeta) {
+          await this.hashStore.storeFileMeta(fileHash, meta as FileMeta);
+          logger.info(`Synced metadata for file ${fileHash} from provider ${provider.name}`);
+        }
+      }
+    }
+
+    if (message.merkleRoot !== provider.merkleRoot) {
+      provider.merkleRoot = message.merkleRoot;
+      logger.info(`Provider ${provider.name} updated Merkle Root: ${message.merkleRoot}`);
+    }
+  }
 
   private async handleProviderMessage(providerId: string, message: any) {
     const provider = this.providers.get(providerId);
     if (!provider) return;
-
+  
     switch (message.type) {
+      case 'SYNC_STATE_PROVIDER':
+        await this.handleProviderSync(providerId, message);
+        break;
       case 'CHUNK_DATA':
         await this.handleChunkData(message);
         break;
-
+  
       case 'MERKLE_ROOT':
-        provider.merkleRoot = message.root;
+        if (message.root !== provider.merkleRoot) {
+          provider.merkleRoot = message.root;
+          logger.info(`Provider ${providerId} updated Merkle Root: ${message.root}`);
+        }
         break;
-
+  
       case 'SYNC_STATE':
         provider.storedChunks = new Set(message.storedChunks);
         break;
     }
   }
+  
 
   private async handleChunkData(message: any) {
     const { fileHash, chunkHash, data } = message;
+    logger.info(`Received chunk ${chunkHash} for fileHash: ${fileHash} from provider.`);
     const readReq = this.readRequests.get(fileHash);
     if (!readReq) return;
 

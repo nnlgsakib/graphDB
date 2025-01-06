@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Image Upload</title>
+  <title>File Upload</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -27,10 +27,10 @@
 </head>
 <body>
   <div class="container">
-    <h1>Upload Image</h1>
+    <h1>Upload File</h1>
     <form id="uploadForm" class="upload-form">
-      <label for="fileInput">Choose an image to upload:</label>
-      <input type="file" id="fileInput" name="file" accept="image/*" required />
+      <label for="fileInput">Choose a file to upload:</label>
+      <input type="file" id="fileInput" name="file" required />
       <button type="submit">Upload</button>
     </form>
     <div id="result" class="result"></div>
@@ -64,12 +64,20 @@
         }
 
         const result = await response.json();
+
+        const fileURL = URL.createObjectURL(file);
+        const isImage = file.type.startsWith('image/');
+
         resultDiv.innerHTML = `
           <h3>Upload Successful</h3>
           <p>File Hash: ${result.uploaded[0].fileHash}</p>
           <p>Merkle Root: ${result.uploaded[0].merkleRoot}</p>
           <p>File Name: ${result.uploaded[0].fileName}</p>
-          <img class="file-preview" src="${URL.createObjectURL(file)}" alt="Uploaded Image Preview" />
+          ${
+            isImage
+              ? `<img class="file-preview" src="${fileURL}" alt="Uploaded File Preview" />`
+              : `<p><a href="${fileURL}" target="_blank">Preview File</a></p>`
+          }
         `;
       } catch (error) {
         resultDiv.innerHTML = `<h3>Error</h3><p>${error.message}</p>`;

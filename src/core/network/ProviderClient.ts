@@ -2,13 +2,14 @@ import WebSocket from 'ws';
 import logger from '../utils/logger';
 import { generateHash } from '../utils/cryptoutils';
 import { buildMerkleTree, generateMerkleProof } from '../utils/merkleutils';
-import { DataStore } from './../storage/DataStore';
-import { HashStore, FileMeta } from './../storage/HashStore';
+import { DataStore } from '../storage/DataStore';
+import { HashStore, FileMeta } from '../storage/HashStore';
 import { ProofStore } from '../storage/ProofStore';
 
 export class ProviderClient {
   private bootHost: string;
   private bootPort: number;
+  private providerName: string;
   private ws: WebSocket | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private syncInterval: NodeJS.Timeout | null = null;
@@ -22,72 +23,57 @@ export class ProviderClient {
   private hashStore: HashStore;
   private proofStore: ProofStore;
 
-  constructor(bootHost: string, bootPort: number, storagePath: string) {
+  constructor(bootHost: string, bootPort: number, storagePath: string, providerName: string) {
     this.bootHost = bootHost;
     this.bootPort = bootPort;
+    this.providerName = providerName;
     
-    // Initialize LevelDB stores
     this.dataStore = new DataStore(`${storagePath}/data`);
     this.hashStore = new HashStore(`${storagePath}/hashes`);
     this.proofStore = new ProofStore(`${storagePath}/proofs`);
   }
 
-  public async start() {
+  public async start(): Promise<void> {
     await this.loadStoredData();
     await this.connectToHost();
     this.startPeriodicSync();
+    logger.info(`ProviderClient started => name=${this.providerName}`);
   }
 
-  public async stop() {
+  public async stop(): Promise<void> {
     if (this.ws) {
       this.ws.close();
+      this.ws = null;
     }
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
+      this.syncInterval = null;
     }
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
     }
   }
 
-  private async loadStoredData() {
+  private async loadStoredData(): Promise<void> {
     try {
       const chunkHashes = await this.dataStore.getAllKeys();
       if (chunkHashes.length > 0) {
         const { root } = buildMerkleTree(chunkHashes.sort());
-        this.merkleRoot = root;
+        if (root) {
+          this.merkleRoot = root;
+          logger.info(`Loaded stored data: ${chunkHashes.length} chunks, Merkle Root: ${this.merkleRoot}`);
+        }
       }
     } catch (error) {
       logger.error('Error loading stored data:', error);
     }
   }
 
-  private async updateMerkleRoot() {
-    const chunkHashes = await this.dataStore.getAllKeys();
-    if (chunkHashes.length === 0) {
-      this.merkleRoot = '';
-      return;
-    }
-    const { root } = buildMerkleTree(chunkHashes.sort());
-    this.merkleRoot = root;
-    
-    this.ws?.send(JSON.stringify({
-      type: 'MERKLE_ROOT',
-      root: this.merkleRoot
-    }));
-  }
-
-  private startPeriodicSync() {
-    this.syncInterval = setInterval(() => {
-      if (this.connected) {
-        this.syncState();
-      }
-    }, 5 * 60 * 1000);
-  }
-
-  private async connectToHost() {
+  private async connectToHost(): Promise<void> {
     if (this.ws) {
       this.ws.terminate();
+      this.ws = null;
     }
 
     this.ws = new WebSocket(`ws://${this.bootHost}:${this.bootPort}`);
@@ -95,8 +81,15 @@ export class ProviderClient {
     this.ws.on('open', () => {
       this.connected = true;
       this.retryCount = 0;
-      logger.info('Connected to host');
-      this.syncState();
+      logger.info('Connected to host server');
+      
+      if (this.ws) {
+        this.ws.send(JSON.stringify({
+          type: 'PROVIDER_CONNECT',
+          providerName: this.providerName,
+          hasExistingData: true
+        }));
+      }
     });
 
     this.ws.on('message', async (message) => {
@@ -120,11 +113,13 @@ export class ProviderClient {
     });
 
     this.ws.on('ping', () => {
-      this.ws?.pong();
+      if (this.ws) {
+        this.ws.pong();
+      }
     });
   }
 
-  private handleDisconnect() {
+  private handleDisconnect(): void {
     if (this.retryCount >= this.maxRetries) {
       logger.error('Max reconnection attempts reached');
       return;
@@ -135,11 +130,23 @@ export class ProviderClient {
     
     this.reconnectTimeout = setTimeout(() => {
       logger.info(`Attempting reconnection (${this.retryCount}/${this.maxRetries})`);
-      this.connectToHost();
+      this.connectToHost().catch(error => 
+        logger.error('Error during reconnection:', error)
+      );
     }, delay);
   }
 
-  private async syncState() {
+  private startPeriodicSync(): void {
+    this.syncInterval = setInterval(() => {
+      if (this.connected) {
+        this.syncState().catch(error => 
+          logger.error('Error during periodic sync:', error)
+        );
+      }
+    }, 5 * 60 * 1000);
+  }
+
+  private async syncState(): Promise<void> {
     if (!this.ws || !this.connected) return;
 
     const storedHashes = await this.dataStore.getAllKeys();
@@ -154,14 +161,14 @@ export class ProviderClient {
     }
 
     this.ws.send(JSON.stringify({
-      type: 'SYNC_STATE',
+      type: 'SYNC_STATE_PROVIDER',
       metadata,
       storedHashes,
       merkleRoot: this.merkleRoot
     }));
   }
 
-  private async handleHostMessage(message: any) {
+  private async handleHostMessage(message: any): Promise<void> {
     switch (message.type) {
       case 'STORE_CHUNK':
         await this.handleStoreChunk(message);
@@ -182,36 +189,43 @@ export class ProviderClient {
       case 'REQUEST_SYNC':
         await this.syncState();
         break;
+
+      case 'REQUEST_METADATA':
+        await this.handleMetadataRequest(message);
+        break;
     }
   }
 
-  private async handleStoreChunk(message: any) {
+  private async handleStoreChunk(message: any): Promise<void> {
     const { chunkHash, data, metadata } = message;
     const buffer = Buffer.from(data, 'hex');
 
-    // Verify chunk hash
     const computedHash = generateHash(buffer);
     if (computedHash !== chunkHash) {
       logger.error(`Hash verification failed for chunk ${chunkHash}`);
       return;
     }
 
-    // Store chunk data and metadata
     await Promise.all([
       this.dataStore.storeData(chunkHash, buffer),
       metadata ? this.hashStore.storeFileMeta(metadata.fileHash, metadata) : Promise.resolve()
     ]);
 
-    // Update Merkle root
-    await this.updateMerkleRoot();
+    const chunkHashes = await this.dataStore.getAllKeys();
+    const { root } = buildMerkleTree(chunkHashes.sort());
+    if (root) {
+      this.merkleRoot = root;
+      logger.info(`Stored chunk ${chunkHash} and updated Merkle root: ${this.merkleRoot}`);
+    }
   }
 
-  private async handleChunkRequest(message: any) {
+  private async handleChunkRequest(message: any): Promise<void> {
     const { fileHash, chunkHash } = message;
     const chunk = await this.dataStore.retrieveData(chunkHash);
 
-    if (chunk) {
-      this.ws?.send(JSON.stringify({
+    if (chunk && this.ws) {
+      logger.info(`Serving chunk: ${chunkHash} for file: ${fileHash}`);
+      this.ws.send(JSON.stringify({
         type: 'CHUNK_DATA',
         fileHash,
         chunkHash,
@@ -220,23 +234,40 @@ export class ProviderClient {
     }
   }
 
-  private async handleChunkProof(message: any) {
+  private async handleMetadataRequest(message: any): Promise<void> {
+    const { fileHash } = message;
+    const metadata = await this.hashStore.retrieveFileMeta(fileHash);
+
+    if (this.ws) {
+      this.ws.send(JSON.stringify({
+        type: 'METADATA_RESPONSE',
+        fileHash,
+        metadata
+      }));
+    }
+  }
+
+  private async handleChunkProof(message: any): Promise<void> {
     const { chunkHash } = message;
     const chunk = await this.dataStore.retrieveData(chunkHash);
 
-    if (!chunk) {
-      logger.warn(`Chunk not found: ${chunkHash}`);
+    if (!chunk || !this.ws) {
+      logger.warn(`Chunk not found or no connection: ${chunkHash}`);
       return;
     }
 
     const allHashes = await this.dataStore.getAllKeys();
     const sortedHashes = allHashes.sort();
     const { tree, root } = buildMerkleTree(sortedHashes);
+    if (!tree || !root) return;
+    
     const proof = generateMerkleProof(tree, chunkHash);
+    if (!proof) return;
 
     await this.proofStore.storeProof(chunkHash, proof);
+    logger.info(`Generated Merkle proof for chunk: ${chunkHash}`);
 
-    this.ws?.send(JSON.stringify({
+    this.ws.send(JSON.stringify({
       type: 'CHUNK_PROOF',
       chunkHash,
       proof,
@@ -244,12 +275,13 @@ export class ProviderClient {
       data: chunk.toString('hex')
     }));
   }
-  private async handleRedistributeChunk(message: any) {
+
+  private async handleRedistributeChunk(message: any): Promise<void> {
     const { chunkHash, targetProviders } = message;
     const chunk = await this.dataStore.retrieveData(chunkHash);
     const metadata = await this.getMetadataForChunk(chunkHash);
 
-    if (chunk && metadata) {
+    if (chunk && metadata && this.ws) {
       targetProviders.forEach((providerId: string) => {
         this.ws?.send(JSON.stringify({
           type: 'FORWARD_CHUNK',
@@ -262,7 +294,6 @@ export class ProviderClient {
     }
   }
 
-
   private async getMetadataForChunk(chunkHash: string): Promise<FileMeta | null> {
     const metadataKeys = await this.hashStore.getAllFileMetaKeys();
     for (const key of metadataKeys) {
@@ -274,7 +305,14 @@ export class ProviderClient {
     return null;
   }
 
-  public async getStats() {
+  public async getStats(): Promise<{
+    providerName: string;
+    totalChunks: number;
+    totalFiles: number;
+    merkleRoot: string;
+    connected: boolean;
+    storageSize: number;
+  }> {
     const chunkHashes = await this.dataStore.getAllKeys();
     const metadataKeys = await this.hashStore.getAllFileMetaKeys();
     let totalSize = 0;
@@ -287,6 +325,7 @@ export class ProviderClient {
     }
 
     return {
+      providerName: this.providerName,
       totalChunks: chunkHashes.length,
       totalFiles: metadataKeys.length,
       merkleRoot: this.merkleRoot,
